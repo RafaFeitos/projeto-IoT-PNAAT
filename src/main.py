@@ -1,54 +1,123 @@
 import machine
 import time
+import network
 
-# ---------------------------------------------------------------------------
-# Configuração de hardware
-# ---------------------------------------------------------------------------
-PIN_LED_EDGE  = 2   # LED verde  — ativo durante inferencia local
-PIN_LED_CLOUD = 4   # LED amarelo — ativo durante requisicao para nuvem
-PIN_ADC_CENA  = 34  # Potenciometro — entrada de complexidade da cena (0-4095)
+# -------------------------------------------------
+# HARDWARE
+# -------------------------------------------------
+PIN_LED_EDGE  = 2   # LED verde — ativo durante inferencia local
+PIN_LED_CLOUD = 4   # LED amarelo — ativo durante offloading para nuvem
+PIN_ADC       = 34  # Potenciometro — representa visibilidade da via
 
 led_edge  = machine.Pin(PIN_LED_EDGE,  machine.Pin.OUT)
 led_cloud = machine.Pin(PIN_LED_CLOUD, machine.Pin.OUT)
-adc_cena  = machine.ADC(machine.Pin(PIN_ADC_CENA))
-adc_cena.atten(machine.ADC.ATTN_11DB)  # Faixa completa 0-3.3V
 
-# ---------------------------------------------------------------------------
-# Constantes do sistema
-# ---------------------------------------------------------------------------
-LIMIAR_COMPLEXIDADE = 0.70  # Acima disso, inferencia local é insuficiente
-LATENCIA_EDGE_MS    = 12    # Tempo simulado de inferencia local (ms)
-LATENCIA_NUVEM_MS   = 180   # Tempo simulado de round-trip para nuvem (ms)
-PAUSA_VISUALIZACAO  = 800   # Pausa adicional para LED ser visivel no Wokwi
-CICLOS_SIMULACAO    = 6     # Ciclos fixos — garante encerramento limpo no CI
-ADC_MAX             = 4095  # Resolucao 12-bit do ADC do ESP32
+adc = machine.ADC(machine.Pin(PIN_ADC))
+adc.atten(machine.ADC.ATTN_11DB)  # Faixa 0-3.3V
 
-# ---------------------------------------------------------------------------
-# Avaliacao de complexidade da cena
-# ---------------------------------------------------------------------------
-def ler_complexidade_cena():
-    """
-    Le o valor ADC do potenciometro e retorna a
-    complexidade normalizada da cena entre 0.0 e 1.0.
-    """
-    leitura = adc_cena.read()
-    return leitura / ADC_MAX
+ADC_MAX = 4095  # ADC de 12 bits
 
+# -------------------------------------------------
+# CONFIGURACAO
+# -------------------------------------------------
+LATENCIA_EDGE  = 12   # Tempo simulado de inferencia local (ms)
+LATENCIA_NUVEM = 180  # Tempo simulado de round-trip para nuvem (ms)
 
-def avaliar_modo(score_complexidade):
+# Histerese: dois limiares distintos evitam comutacoes excessivas
+# em zona intermediaria — comportamento analogo a sistemas reais
+LIMIAR_EDGE  = 0.48  # Abaixo disso, retorna para modo EDGE
+LIMIAR_NUVEM = 0.58  # Acima disso, entra em modo NUVEM
+
+# Pesos da formula de complexidade
+# Visibilidade tem peso dominante pois impacta diretamente
+# a qualidade da inferencia local em tempo real
+PESO_VIS = 0.55
+PESO_DEN = 0.30
+PESO_VEL = 0.15
+
+# Valores fixos representando cenario urbano tipico
+DENSIDADE  = 0.55
+VELOCIDADE = 0.45
+
+INTERVALO_LEITURA = 150   # Intervalo entre leituras do ADC (ms)
+TEMPO_TOTAL       = 40000 # Duracao total da simulacao (ms)
+
+SSID     = "Wokwi-GUEST"  # Rede WiFi simulada disponivel no Wokwi
+PASSWORD = ""              # Rede aberta no ambiente de simulacao
+
+# -------------------------------------------------
+# WIFI
+# -------------------------------------------------
+def conectar_wifi():
     """
-    Retorna o modo de inferencia com base no limiar de complexidade.
-    EDGE: processamento local suficiente e preferivel.
-    NUVEM: complexidade excede capacidade de processamento embarcado.
+    Conecta ao WiFi do Wokwi.
+    Retorna True se a conexão for estabelecida.
     """
-    if score_complexidade >= LIMIAR_COMPLEXIDADE:
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(SSID, PASSWORD)
+
+    tentativas = 0
+    while not wlan.isconnected() and tentativas < 10:
+        time.sleep_ms(500)
+        tentativas += 1
+
+    if wlan.isconnected():
+        print("WiFi conectado IP:", wlan.ifconfig()[0])
+        return True
+
+    print("WiFi indisponivel")
+    return False
+
+# -------------------------------------------------
+# LEITURA SUAVIZADA DO SENSOR
+# -------------------------------------------------
+def ler_visibilidade():
+    """
+    Lê o potenciômetro e normaliza o valor entre 0.0 e 1.0.
+    A média de 4 amostras reduz ruído do ADC.
+    """
+    soma = 0
+    for _ in range(4):
+        soma += adc.read()
+        time.sleep_ms(2)
+    return round((soma / 4) / ADC_MAX, 2)
+
+# -------------------------------------------------
+# CALCULO DO SCORE
+# -------------------------------------------------
+def calcular_score(vis):
+    """
+    Calcula o score de complexidade da cena.
+    Combina visibilidade, densidade e velocidade em um único valor.
+    """
+    return round(
+        (DENSIDADE  * PESO_DEN) +
+        (vis        * PESO_VIS) +
+        (VELOCIDADE * PESO_VEL),
+        2
+    )
+
+# -------------------------------------------------
+# DECISAO COM HISTERESE
+# -------------------------------------------------
+def decidir_modo(score, modo_atual):
+    """
+    Aplica histerese na decisão de modo.
+    Só muda de estado quando o score ultrapassa um dos limiares,
+    evitando comutações desnecessárias na zona intermediária.
+    """
+    if score >= LIMIAR_NUVEM:
         return "NUVEM"
-    return "EDGE"
+    if score <= LIMIAR_EDGE:
+        return "EDGE"
+    return modo_atual  # Zona neutra — mantem estado atual
 
-# ---------------------------------------------------------------------------
-# Controle dos LEDs por estado
-# ---------------------------------------------------------------------------
-def definir_leds(modo):
+# -------------------------------------------------
+# CONTROLE DOS LEDS
+# -------------------------------------------------
+def atualizar_leds(modo):
+    """Atualiza LEDs conforme o modo de inferencia ativo."""
     if modo == "EDGE":
         led_edge.value(1)
         led_cloud.value(0)
@@ -56,37 +125,73 @@ def definir_leds(modo):
         led_edge.value(0)
         led_cloud.value(1)
 
+# -------------------------------------------------
+# LATENCIA NAO BLOQUEANTE
+# -------------------------------------------------
+def executar_latencia(modo_atual, duracao_ms, wifi_ok):
+    """
+    Simula a latência do processamento sem bloquear o sistema.
+    Durante a espera, o sensor continua sendo monitorado.
+    """
+    inicio = time.ticks_ms()
 
-def desligar_leds():
-    led_edge.value(0)
-    led_cloud.value(0)
+    while time.ticks_diff(time.ticks_ms(), inicio) < duracao_ms:
+        vis       = ler_visibilidade()
+        score     = calcular_score(vis)
+        novo_modo = decidir_modo(score, modo_atual)
 
-# ---------------------------------------------------------------------------
-# Telemetria serial
-# ---------------------------------------------------------------------------
-def registrar(ciclo, score, modo, latencia_ms):
-    print("[CICLO {:02d}] complexidade={:.2f} | modo={} | latencia={}ms".format(
-        ciclo, score, modo, latencia_ms
-    ))
+        if novo_modo != modo_atual:
+            atualizar_leds(novo_modo)
+            mensagem = "enviando para nuvem..." if novo_modo == "NUVEM" else "retornando para edge..."
+            latencia = LATENCIA_NUVEM if novo_modo == "NUVEM" else LATENCIA_EDGE
+            print("Mudanca durante latencia -> {}".format(mensagem))
+            print("score={} | vis={} | modo={} | latencia={}ms".format(
+                score, vis, novo_modo, latencia))
+            return novo_modo
 
-# ---------------------------------------------------------------------------
-# Execucao principal
-# ---------------------------------------------------------------------------
+        time.sleep_ms(INTERVALO_LEITURA)
+
+    return modo_atual
+
+# -------------------------------------------------
+# PROGRAMA PRINCIPAL
+# -------------------------------------------------
 print("SYSTEM READY")
-print("Sistema de decisao Edge/Cloud — prototipo de veiculo autonomo")
-print("limiar={} | ciclos={}".format(LIMIAR_COMPLEXIDADE, CICLOS_SIMULACAO))
+print("Sistema Edge/Cloud com resposta em tempo real")
 print("---")
 
-for ciclo in range(1, CICLOS_SIMULACAO + 1):
-    score    = ler_complexidade_cena()
-    modo     = avaliar_modo(score)
-    latencia = LATENCIA_EDGE_MS if modo == "EDGE" else LATENCIA_NUVEM_MS
+wifi_ok = conectar_wifi()
+print("---")
 
-    definir_leds(modo)
-    time.sleep_ms(latencia)           # Simula tempo real de processamento
-    registrar(ciclo, score, modo, latencia)
-    time.sleep_ms(PAUSA_VISUALIZACAO) # Pausa para LED ser visivel no Wokwi
+modo_atual = "EDGE"
+atualizar_leds(modo_atual)
+inicio = time.ticks_ms()
 
-desligar_leds()
+while time.ticks_diff(time.ticks_ms(), inicio) < TEMPO_TOTAL:
+    vis       = ler_visibilidade()
+    score     = calcular_score(vis)
+    novo_modo = decidir_modo(score, modo_atual)
+
+    if novo_modo != modo_atual:
+        modo_atual = novo_modo
+        atualizar_leds(modo_atual)
+        mensagem = "enviando para nuvem..." if modo_atual == "NUVEM" else "retornando para edge..."
+        latencia = LATENCIA_NUVEM if modo_atual == "NUVEM" else LATENCIA_EDGE
+        print("Mudanca detectada -> {}".format(mensagem))
+        print("score={} | vis={} | modo={} | latencia={}ms".format(
+            score, vis, modo_atual, latencia))
+        modo_atual = executar_latencia(modo_atual, latencia, wifi_ok)
+
+    else:
+        latencia = LATENCIA_NUVEM if modo_atual == "NUVEM" else LATENCIA_EDGE
+        print("score={} | vis={} | modo={} | latencia={}ms".format(
+            score, vis, modo_atual, latencia))
+        time.sleep_ms(INTERVALO_LEITURA)
+
+# -------------------------------------------------
+# FINALIZACAO
+# -------------------------------------------------
+led_edge.value(0)
+led_cloud.value(0)
 print("---")
 print("SIMULATION COMPLETE")
