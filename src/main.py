@@ -51,7 +51,7 @@ PASSWORD = ""              # Rede aberta no ambiente de simulacao
 def conectar_wifi():
     """
     Conecta ao WiFi do Wokwi.
-    Retorna True se a conexão for estabelecida.
+    Retorna True se a conexao for estabelecida.
     """
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
@@ -74,8 +74,8 @@ def conectar_wifi():
 # -------------------------------------------------
 def ler_visibilidade():
     """
-    Lê o potenciômetro e normaliza o valor entre 0.0 e 1.0.
-    A média de 4 amostras reduz ruído do ADC.
+    Le o potenciometro e normaliza o valor entre 0.0 e 1.0.
+    A media de 4 amostras reduz ruido do ADC.
     """
     soma = 0
     for _ in range(4):
@@ -89,7 +89,7 @@ def ler_visibilidade():
 def calcular_score(vis):
     """
     Calcula o score de complexidade da cena.
-    Combina visibilidade, densidade e velocidade em um único valor.
+    Combina visibilidade, densidade e velocidade em um unico valor.
     """
     return round(
         (DENSIDADE  * PESO_DEN) +
@@ -103,9 +103,9 @@ def calcular_score(vis):
 # -------------------------------------------------
 def decidir_modo(score, modo_atual):
     """
-    Aplica histerese na decisão de modo.
-    Só muda de estado quando o score ultrapassa um dos limiares,
-    evitando comutações desnecessárias na zona intermediária.
+    Aplica histerese na decisao de modo.
+    So muda de estado quando o score ultrapassa um dos limiares,
+    evitando comutacoes desnecessarias na zona intermediaria.
     """
     if score >= LIMIAR_NUVEM:
         return "NUVEM"
@@ -130,7 +130,7 @@ def atualizar_leds(modo):
 # -------------------------------------------------
 def executar_latencia(modo_atual, duracao_ms, wifi_ok):
     """
-    Simula a latência do processamento sem bloquear o sistema.
+    Simula a latencia do processamento sem bloquear o sistema.
     Durante a espera, o sensor continua sendo monitorado.
     """
     inicio = time.ticks_ms()
@@ -154,6 +154,25 @@ def executar_latencia(modo_atual, duracao_ms, wifi_ok):
     return modo_atual
 
 # -------------------------------------------------
+# TELEMETRIA — RESUMO DA SESSAO
+# -------------------------------------------------
+def imprimir_resumo(trocas, ms_edge, ms_nuvem):
+    """
+    Imprime resumo da sessao ao final da simulacao.
+    Evidencia o comportamento do sistema de forma rastreavel.
+    """
+    total = ms_edge + ms_nuvem
+    if total == 0:
+        return
+
+    pct_edge  = round((ms_edge  / total) * 100)
+    pct_nuvem = round((ms_nuvem / total) * 100)
+
+    print("RESUMO DA SESSAO")
+    print("trocas={} | edge={}% | nuvem={}%".format(
+        trocas, pct_edge, pct_nuvem))
+
+# -------------------------------------------------
 # PROGRAMA PRINCIPAL
 # -------------------------------------------------
 print("SYSTEM READY")
@@ -163,8 +182,15 @@ print("---")
 wifi_ok = conectar_wifi()
 print("---")
 
-modo_atual = "EDGE"
+modo_atual    = "EDGE"
 atualizar_leds(modo_atual)
+
+# Contadores de telemetria
+trocas        = 0
+ms_edge       = 0
+ms_nuvem      = 0
+ultimo_tick   = time.ticks_ms()
+
 inicio = time.ticks_ms()
 
 while time.ticks_diff(time.ticks_ms(), inicio) < TEMPO_TOTAL:
@@ -172,7 +198,17 @@ while time.ticks_diff(time.ticks_ms(), inicio) < TEMPO_TOTAL:
     score     = calcular_score(vis)
     novo_modo = decidir_modo(score, modo_atual)
 
+    # Acumula tempo no modo atual antes de qualquer troca
+    agora    = time.ticks_ms()
+    delta    = time.ticks_diff(agora, ultimo_tick)
+    if modo_atual == "EDGE":
+        ms_edge += delta
+    else:
+        ms_nuvem += delta
+    ultimo_tick = agora
+
     if novo_modo != modo_atual:
+        trocas    += 1
         modo_atual = novo_modo
         atualizar_leds(modo_atual)
         mensagem = "enviando para nuvem..." if modo_atual == "NUVEM" else "retornando para edge..."
@@ -193,5 +229,7 @@ while time.ticks_diff(time.ticks_ms(), inicio) < TEMPO_TOTAL:
 # -------------------------------------------------
 led_edge.value(0)
 led_cloud.value(0)
+print("---")
+imprimir_resumo(trocas, ms_edge, ms_nuvem)
 print("---")
 print("SIMULATION COMPLETE")
